@@ -44,16 +44,28 @@ func (a *App) Start(ctx context.Context) (err error) {
 
 	instanceLauncher := instance.NewLauncher(settings.VlcPath, settings.ApiProtocol, a.logger)
 
+	// Try to find file pairs based on naming convention
+	filePaths, pairErr := FindFilePair(settings.FilePaths)
+	if pairErr != nil {
+		a.logger.Err("File pairing: %s", pairErr.Error())
+		// Continue with original paths
+		filePaths = settings.FilePaths
+	} else if len(filePaths) == 2 && len(settings.FilePaths) == 1 {
+		a.logger.Info("Auto-detected file pair:")
+		a.logger.Info("  Conductor: %s", filePaths[0])
+		a.logger.Info("  Audience:  %s", filePaths[1])
+	}
+
 	var filePath string
-	if len(settings.FilePaths) > 0 {
-		filePath = settings.FilePaths[0]
+	if len(filePaths) > 0 {
+		filePath = filePaths[0]
 	}
 
 	playersSyncer := syncer.NewSyncer(
 		settings,
 		instanceLauncher,
 		a.logger,
-		settings.FilePaths,
+		filePaths,
 	)
 
 	settingsSyncCtx, settingsSyncCtxCancel := context.WithCancel(ctx)

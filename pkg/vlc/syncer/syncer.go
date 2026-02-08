@@ -237,38 +237,21 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 		s.followersSkipUpdatesDuration,
 		timings.WaitForAutoSeekAfterFileOpenedDuration,
 	))
-	wg := sync.WaitGroup{}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.launchMissingInstances(
-			ctx,
-			s.settings.GetInstancesNumber().GetValue(),
-		)
-	}()
+	// First, launch any missing instances
+	s.launchMissingInstances(
+		ctx,
+		s.settings.GetInstancesNumber().GetValue(),
+	)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.players.Iterate(func(pl *player) bool {
-			if pl.GetID() != srcPlayerID {
-				// Get the file path for this instance based on its ID
-				// Instance IDs start at 1, array indices start at 0
-				fileURI := s.getFileURIForInstance(pl.GetID())
-				_, _ = pl.SendCmdGroup(
-					ctx,
-					extended.CmdGroup{
-						OpenFile: typeutil.NewOptional(fileURI),
-					},
-					repetition.WithInterval(timings.CommandsRepeatInterval),
-				)
-			}
-			return true
-		})
-	}()
+	// Give newly launched instances a moment to be ready,
+	// then force a sync by sending play command to all
+	time.Sleep(200 * time.Millisecond)
 
-	wg.Wait()
+	// Send play command to all instances to start synchronously
+	s.sendAllPlayersCommands(ctx, extended.CmdGroup{
+		State: typeutil.NewOptional(basic.PlaybackStatePlaying),
+	})
 }
 
 // getFileURIForInstance returns the file path for a specific instance ID
