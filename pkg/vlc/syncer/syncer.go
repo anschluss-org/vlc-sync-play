@@ -264,14 +264,33 @@ func (s *Syncer) syncNewInstancesWithSource(ctx context.Context, srcPlayerID uin
 		return
 	}
 
-	// Get source player's commands (play/pause/position)
-	commands := srcPlayer.client.state.GetPauseOrResumeCommand()
-	if !commands.State.HasValue && !commands.Seek.HasValue {
-		// No valid state to sync
+	// Get source player's current status
+	srcStatus, err := srcPlayer.client.client.GetStatusEx(ctx, repetition.Single())
+	if err != nil {
+		s.logger.Err("Failed to get source status for sync: %s", err.Error())
 		return
 	}
 
-	s.logger.Info("Syncing new instances with source player P[%d]", srcPlayerID)
+	// Only sync if source is actually playing
+	if srcStatus.State != basic.PlaybackStatePlaying {
+		s.logger.Info("Source player P[%d] not playing, skipping sync", srcPlayerID)
+		return
+	}
+
+	s.logger.Info("Syncing new instances with playing source player P[%d]", srcPlayerID)
+
+	// Build commands to match source state
+	commands := extended.CmdGroup{
+		State: typeutil.NewOptional(basic.PlaybackStatePlaying),
+	}
+
+	// Also sync position if available
+	if srcStatus.Position > 0 {
+		expectedPos := srcStatus.Position
+		commands.Seek.Set(func(atMoment time.Time) float64 {
+			return expectedPos
+		})
+	}
 
 	// Send commands to all other players
 	wg := sync.WaitGroup{}
