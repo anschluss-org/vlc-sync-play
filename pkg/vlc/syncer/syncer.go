@@ -295,7 +295,13 @@ func (s *Syncer) syncPlayers(
 	srcUpdate *playerUpdate,
 ) {
 	s.logger.Info("-- Syncing caused by %d update: %s", srcUpdate.player.GetID(), srcUpdate.update.String())
-	commands := srcUpdate.GetSyncCommands()
+
+	// Don't sync FileURI - each instance should keep its own file
+	// Files are set during launch or explicit file open events only
+	syncProps := srcUpdate.update.ChangedProps
+	syncProps.SetFileURI(false)
+
+	commands := srcUpdate.player.client.state.GetSyncCommands(syncProps)
 	s.syncOtherPlayersNoSeek(ctx, srcUpdate, commands)
 	if commands.Seek.HasValue && s.players.Len() > 1 {
 		var skipPlayer *player
@@ -329,12 +335,13 @@ func (s *Syncer) syncOtherPlayersNoSeek(
 		// Check if additional props sync required
 		dstUpdate, err := pl.client.state.GetUpdate(&srcUpdate.update.Status)
 		dstUpdate.ChangedProps.SetPosition(false)
+		dstUpdate.ChangedProps.SetFileURI(false) // Don't sync FileURI - each instance has its own file
 
 		if err == nil && !srcUpdate.update.ChangedProps.Includes(dstUpdate.ChangedProps) {
 			s.logger.Info("P[%d]: additional sync [%s] -> [%s]", pl.GetID(), srcUpdate.update, dstUpdate)
-			dstCommands = srcUpdate.player.client.state.GetSyncCommands(
-				srcUpdate.update.ChangedProps.Union(dstUpdate.ChangedProps),
-			)
+			additionalProps := srcUpdate.update.ChangedProps.Union(dstUpdate.ChangedProps)
+			additionalProps.SetFileURI(false) // Don't sync FileURI
+			dstCommands = srcUpdate.player.client.state.GetSyncCommands(additionalProps)
 		}
 
 		waitGr.Add(1)
