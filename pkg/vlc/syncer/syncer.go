@@ -238,20 +238,12 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 		timings.WaitForAutoSeekAfterFileOpenedDuration,
 	))
 
-	// First, launch any missing instances
-	s.launchMissingInstances(
+	// Launch any missing instances
+	// The normal sync cycle will handle syncing their state
+	go s.launchMissingInstances(
 		ctx,
 		s.settings.GetInstancesNumber().GetValue(),
 	)
-
-	// Give newly launched instances a moment to be ready,
-	// then force a sync by sending play command to all
-	time.Sleep(200 * time.Millisecond)
-
-	// Send play command to all instances to start synchronously
-	s.sendAllPlayersCommands(ctx, extended.CmdGroup{
-		State: typeutil.NewOptional(basic.PlaybackStatePlaying),
-	})
 }
 
 // getFileURIForInstance returns the file path for a specific instance ID
