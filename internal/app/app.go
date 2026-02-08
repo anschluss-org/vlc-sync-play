@@ -53,6 +53,7 @@ func (a *App) Start(ctx context.Context) (err error) {
 		settings,
 		instanceLauncher,
 		a.logger,
+		settings.FilePaths,
 	)
 
 	settingsSyncCtx, settingsSyncCtxCancel := context.WithCancel(ctx)

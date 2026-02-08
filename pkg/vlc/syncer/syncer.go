@@ -26,12 +26,14 @@ type Syncer struct {
 	isStarted                    atomic.Bool
 	instanceLauncher             instance.Launcher
 	logger                       logging.Logger
+	filePaths                    []string // File paths for each instance
 }
 
 func NewSyncer(
 	settings Settings,
 	instanceLauncher instance.Launcher,
 	logger logging.Logger,
+	filePaths []string,
 ) *Syncer {
 	return &Syncer{
 		players:  newPlayers(),
@@ -42,6 +44,7 @@ func NewSyncer(
 		state:            NewState(),
 		instanceLauncher: instanceLauncher,
 		logger:           logger,
+		filePaths:        filePaths,
 	}
 }
 
@@ -180,17 +183,34 @@ func (s *Syncer) launchInstances(
 	fileURI string,
 	missingInstancesNumber int,
 ) error {
-	options := instance.LaunchOptions{
-		// First instance will be launched with video
-		NoVideo: s.players.Len() > 0 && s.settings.GetNoVideo().GetValue(),
-		FileURI: typeutil.Optional[string]{
-			HasValue: fileURI != "",
-			Value:    fileURI,
-		},
-	}
 	errGr := errgroup.Group{}
+	currentPlayerCount := s.players.Len()
 
 	for i := 0; i < missingInstancesNumber; i++ {
+		// Calculate which instance number this will be (0-based for array access)
+		instanceIndex := currentPlayerCount + i
+
+		// Get the appropriate file for this instance
+		var instanceFileURI string
+		if len(s.filePaths) > instanceIndex {
+			instanceFileURI = s.filePaths[instanceIndex]
+			s.logger.Info("Instance %d will use file: %s", instanceIndex+1, instanceFileURI)
+		} else if len(s.filePaths) > 0 {
+			instanceFileURI = s.filePaths[0]
+			s.logger.Info("Instance %d will use fallback file: %s", instanceIndex+1, instanceFileURI)
+		} else {
+			instanceFileURI = fileURI
+		}
+
+		options := instance.LaunchOptions{
+			// First instance will be launched with video
+			NoVideo: instanceIndex > 0 && s.settings.GetNoVideo().GetValue(),
+			FileURI: typeutil.Optional[string]{
+				HasValue: instanceFileURI != "",
+				Value:    instanceFileURI,
+			},
+		}
+
 		errGr.Go(func() error {
 			s.logger.Info("Launching new instance")
 
@@ -231,10 +251,13 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 		defer wg.Done()
 		s.players.Iterate(func(pl *player) bool {
 			if pl.GetID() != srcPlayerID {
+				// Get the file path for this instance based on its ID
+				// Instance IDs start at 1, array indices start at 0
+				fileURI := s.getFileURIForInstance(pl.GetID())
 				_, _ = pl.SendCmdGroup(
 					ctx,
 					extended.CmdGroup{
-						OpenFile: typeutil.NewOptional(s.state.fileURI.GetValue()),
+						OpenFile: typeutil.NewOptional(fileURI),
 					},
 					repetition.WithInterval(timings.CommandsRepeatInterval),
 				)
@@ -244,6 +267,25 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 	}()
 
 	wg.Wait()
+}
+
+// getFileURIForInstance returns the file path for a specific instance ID
+// Instance IDs start at 1, so we subtract 1 to get the array index
+func (s *Syncer) getFileURIForInstance(instanceID uint) string {
+	if len(s.filePaths) == 0 {
+		return s.state.fileURI.GetValue()
+	}
+
+	// Convert instance ID to 0-based index
+	index := int(instanceID) - 1
+
+	// If we have a specific file for this instance, use it
+	if index >= 0 && index < len(s.filePaths) {
+		return s.filePaths[index]
+	}
+
+	// Fall back to the first file if we don't have enough files
+	return s.filePaths[0]
 }
 
 func (s *Syncer) syncPlayers(
