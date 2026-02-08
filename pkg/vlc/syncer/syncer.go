@@ -239,11 +239,53 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 	))
 
 	// Launch any missing instances
-	// The normal sync cycle will handle syncing their state
-	go s.launchMissingInstances(
-		ctx,
-		s.settings.GetInstancesNumber().GetValue(),
-	)
+	go func() {
+		s.launchMissingInstances(ctx, s.settings.GetInstancesNumber().GetValue())
+
+		// After launching, wait for new instances to be ready, then sync them
+		time.Sleep(300 * time.Millisecond)
+		s.syncNewInstancesWithSource(ctx, srcPlayerID)
+	}()
+}
+
+// syncNewInstancesWithSource syncs newly launched instances with the source player's current state
+func (s *Syncer) syncNewInstancesWithSource(ctx context.Context, srcPlayerID uint) {
+	// Find the source player
+	var srcPlayer *player
+	s.players.Iterate(func(pl *player) bool {
+		if pl.GetID() == srcPlayerID {
+			srcPlayer = pl
+			return false
+		}
+		return true
+	})
+
+	if srcPlayer == nil {
+		return
+	}
+
+	// Get source player's commands (play/pause/position)
+	commands := srcPlayer.client.state.GetPauseOrResumeCommand()
+	if !commands.State.HasValue && !commands.Seek.HasValue {
+		// No valid state to sync
+		return
+	}
+
+	s.logger.Info("Syncing new instances with source player P[%d]", srcPlayerID)
+
+	// Send commands to all other players
+	wg := sync.WaitGroup{}
+	s.players.Iterate(func(pl *player) bool {
+		if pl.GetID() != srcPlayerID {
+			wg.Add(1)
+			go func(player *player) {
+				defer wg.Done()
+				_, _ = player.SendCmdGroup(ctx, commands, repetition.WithInterval(timings.CommandsRepeatInterval))
+			}(pl)
+		}
+		return true
+	})
+	wg.Wait()
 }
 
 // getFileURIForInstance returns the file path for a specific instance ID
