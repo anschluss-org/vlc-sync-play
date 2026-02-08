@@ -29,14 +29,19 @@ This works on both **Apple Silicon (M1/M2/M3)** and **Intel Macs**.
 ### 2. Basic Usage
 
 ```bash
-# Run with two different files
+# Option 1: Run with two different files (explicit)
 ./dist/vlc-sync-play-universal conductor-version.mp4 audience-version.mp4
+
+# Option 2: Smart file pairing ✨ (NEW!)
+# Just specify one file - the matching file is found automatically
+./dist/vlc-sync-play-universal movie-conductor.mp4
+# Automatically finds and uses movie-audience.mp4
 ```
 
 This will:
-1. Launch VLC instance 1 with `conductor-version.mp4`
-2. Launch VLC instance 2 with `audience-version.mp4`
-3. Keep them perfectly synchronized
+1. Launch VLC instance 1 with `conductor-version.mp4` (or `movie-conductor.mp4`)
+2. Launch VLC instance 2 with `audience-version.mp4` (or `movie-audience.mp4`)
+3. **Both start playing automatically and stay perfectly synchronized** ✨
 
 ### 3. Recommended Settings
 
@@ -62,6 +67,37 @@ This will:
 --debug               Enable debug logging
 --vlc PATH            Custom VLC executable path
 ```
+
+## ✨ Smart File Pairing (NEW!)
+
+### Naming Convention
+
+Name your files using the pattern: **`[basename]-[conductor|audience].[ext]`**
+
+Examples:
+- `movie-conductor.mp4` + `movie-audience.mp4`
+- `symphony-conductor.mov` + `symphony-audience.mov`
+- `performance-conductor.mkv` + `performance-audience.mkv`
+
+### How It Works
+
+Specify just **one file**, and the matching pair is found automatically:
+
+```bash
+# Any of these work:
+./dist/vlc-sync-play-universal movie-conductor.mp4
+./dist/vlc-sync-play-universal movie-audience.mp4
+./dist/vlc-sync-play-universal movie.mp4  # Finds both!
+```
+
+When auto-detected, you'll see:
+```
+Auto-detected file pair:
+  Conductor: /path/to/movie-conductor.mp4
+  Audience:  /path/to/movie-audience.mp4
+```
+
+See **[FILE-NAMING.md](FILE-NAMING.md)** for complete details.
 
 ## 🔧 Testing
 
