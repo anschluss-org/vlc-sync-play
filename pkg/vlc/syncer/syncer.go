@@ -211,10 +211,12 @@ func (s *Syncer) launchInstances(
 			},
 		}
 
+		// Capture options by value to avoid closure bug
+		launchOpts := options
 		errGr.Go(func() error {
 			s.logger.Info("Launching new instance")
 
-			newInstance, err := s.instanceLauncher.Launch(ctx, options)
+			newInstance, err := s.instanceLauncher.Launch(ctx, launchOpts)
 			if err != nil {
 				return fmt.Errorf("failed to create new instance: %w", err)
 			}
