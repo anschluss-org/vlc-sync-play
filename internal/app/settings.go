@@ -41,7 +41,8 @@ func (s *Settings) SetDefaults() {
 	s.NoVideo.SetValue(false)
 	s.PollingInterval.SetValue(100 * time.Millisecond)
 	s.ClickPause.SetValue(static_features.ClickPause)
-	s.ReSeekSrc.SetValue(true)
+	// Set to false to avoid choppy audio from constant re-seeking
+	s.ReSeekSrc.SetValue(false)
 }
 
 func (s *Settings) GetPollingInterval() rx.Observable[time.Duration] {

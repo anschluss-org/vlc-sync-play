@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/cardinalby/vlc-sync-play/internal/app/static_features"
 	"github.com/cardinalby/vlc-sync-play/pkg/util/logging"
@@ -84,7 +85,9 @@ func (l *launcher) getArgs(apiClient basic.ApiClient, options LaunchOptions) []s
 	if static_features.ClickPause {
 		args = append(args, "--verbose", "2")
 	}
+	// Auto-start playlist to avoid showing playlist window
 	if static_features.LaunchWithFile && options.FileURI.HasValue {
+		args = append(args, "--playlist-autostart")
 		args = append(args, options.FileURI.Value)
 	}
 	return args
@@ -141,5 +144,35 @@ func (l *launcher) waitUntilReady(
 		}
 		l.logger.Info("* file opened")
 	}
+
+	// If we used playlist-autostart, wait for playback to start then pause
+	//goland:noinspection GoBoolExpressions
+	if fileURI != "" && static_features.LaunchWithFile {
+		l.logger.Info("* waiting for playback to start")
+
+		// Poll until playback actually starts (file loaded and playing)
+		maxAttempts := 50 // 5 seconds max
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			status, err := inst.Client.GetStatusEx(ctx, repetition.Single())
+			if err == nil && status.State == basic.PlaybackStatePlaying && status.LengthSec > 0 {
+				l.logger.Info("* playback started, now pausing")
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Now send pause command
+		if _, err := inst.Client.SendCmdGroup(
+			ctx,
+			extended.CmdGroup{
+				State: typeutil.NewOptional(basic.PlaybackStatePaused),
+			},
+			repetition.WithInterval(100 * time.Millisecond),
+		); err != nil {
+			return fmt.Errorf("failed to pause: %w", err)
+		}
+		l.logger.Info("* paused and ready at first frame")
+	}
+
 	return nil
 }

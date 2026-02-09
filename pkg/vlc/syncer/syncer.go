@@ -3,6 +3,9 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +17,6 @@ import (
 	"github.com/cardinalby/vlc-sync-play/pkg/vlc/client/extended/repetition"
 	"github.com/cardinalby/vlc-sync-play/pkg/vlc/client/timings"
 	"github.com/cardinalby/vlc-sync-play/pkg/vlc/instance"
-	"golang.org/x/sync/errgroup"
 )
 
 type Syncer struct {
@@ -49,9 +51,31 @@ func NewSyncer(
 }
 
 func (s *Syncer) Start(ctx context.Context, initFileURI string) error {
-	if err := s.launchInstances(ctx, initFileURI, 1); err != nil {
+	// Launch all instances at startup (not just 1)
+	instancesNumber := s.settings.GetInstancesNumber().GetValue()
+	s.logger.Info("=== Starting with %d instances, initFileURI: %s ===", instancesNumber, initFileURI)
+	s.logger.Info("=== filePaths configured: %v ===", s.filePaths)
+	if err := s.launchInstances(ctx, initFileURI, instancesNumber); err != nil {
 		return err
 	}
+	s.logger.Info("=== All instances launched ===")
+
+	// Wait a moment, then check all instance states
+	go func() {
+		time.Sleep(2 * time.Second)
+		s.logger.Info("=== Checking initial instance states ===")
+		s.players.Iterate(func(pl *player) bool {
+			status, err := pl.client.client.GetStatusEx(ctx, repetition.Single())
+			if err != nil {
+				s.logger.Err("P[%d]: Failed to get status: %s", pl.GetID(), err.Error())
+			} else {
+				s.logger.Info("P[%d]: FileURI=%s, State=%s, Position=%.2f, Length=%.2f",
+					pl.GetID(), status.FileURI, status.State, status.Position, status.LengthSec)
+			}
+			return true
+		})
+		s.logger.Info("=== Initial state check complete ===")
+	}()
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -84,8 +108,41 @@ func (s *Syncer) Start(ctx context.Context, initFileURI string) error {
 func (s *Syncer) onEvent(ctx context.Context, event playerEvent) error {
 	switch event.event {
 	case instance.StderrEventMouse1Click:
-		commands := event.player.client.state.GetPauseOrResumeCommand()
-		s.sendAllPlayersCommands(ctx, commands)
+		// Mouse click detected - sync all players to clicked player's state
+		go func() {
+			// Small delay to let the click action complete
+			time.Sleep(150 * time.Millisecond)
+
+			s.logger.Info("Mouse click detected in P[%d], syncing all players", event.player.GetID())
+
+			s.syncingMu.Lock()
+			defer s.syncingMu.Unlock()
+
+			// Get current status of the clicked player
+			status, err := event.player.client.client.GetStatusEx(ctx, repetition.Single())
+			if err != nil {
+				s.logger.Err("Failed to get status after click: %s", err.Error())
+				return
+			}
+
+			// Create update to reflect the state change
+			update, err := event.player.client.state.GetUpdate(&status)
+			if err != nil {
+				return
+			}
+
+			// Mark this as the source and trigger sync
+			s.state.lastSyncedFromID = event.player.GetID()
+			plUpdate := &playerUpdate{
+				player: event.player,
+				update: update,
+			}
+
+			// Sync the state change (this will sync play/pause state)
+			if update.ChangedProps.HasState() || update.ChangedProps.HasPosition() {
+				s.syncPlayers(ctx, plUpdate)
+			}
+		}()
 	}
 	return nil
 }
@@ -124,6 +181,10 @@ func (s *Syncer) onUpdate(ctx context.Context, plUpdate *playerUpdate) error {
 	s.syncingMu.Lock()
 	defer s.syncingMu.Unlock()
 
+	s.logger.Info(">>> P[%d] UPDATE: State=%s, Position=%.2f, IsNatural=%v, Changed=%s",
+		plUpdate.player.GetID(), plUpdate.update.Status.State, plUpdate.update.Status.Position,
+		plUpdate.update.IsNatural, plUpdate.update.ChangedProps.String())
+
 	if canAccept, getReason := s.checkCanAcceptUpdate(plUpdate); !canAccept {
 		s.logger.Info(getReason())
 		return nil
@@ -134,12 +195,25 @@ func (s *Syncer) onUpdate(ctx context.Context, plUpdate *playerUpdate) error {
 
 	if plUpdate.update.ChangedProps.HasFileURI() &&
 		plUpdate.update.Status.State != basic.PlaybackStateStopped {
+		s.logger.Info(">>> File opened event detected")
 		s.onFileOpened(ctx, plUpdate.player.GetID())
 		return nil
 	}
 
 	if !plUpdate.update.IsNatural {
+		s.logger.Info(">>> Non-natural update, triggering sync")
 		s.syncPlayers(ctx, plUpdate)
+	} else if plUpdate.update.ChangedProps.HasState() {
+		// Natural state change (user clicked play/pause)
+		// Sync to other instances if this is the source player
+		if plUpdate.player.GetID() == s.state.lastSyncedFromID || s.state.lastSyncedFromID == instance.IDNone {
+			s.logger.Info(">>> Natural state change from source player P[%d]: %s -> triggering sync", plUpdate.player.GetID(), plUpdate.update.Status.State)
+			s.syncPlayers(ctx, plUpdate)
+		} else {
+			s.logger.Info(">>> Natural state change from non-source player P[%d] (source is P[%d]) - NOT syncing", plUpdate.player.GetID(), s.state.lastSyncedFromID)
+		}
+	} else {
+		s.logger.Info(">>> Update doesn't trigger sync (no state change or not natural)")
 	}
 	return nil
 }
@@ -183,9 +257,9 @@ func (s *Syncer) launchInstances(
 	fileURI string,
 	missingInstancesNumber int,
 ) error {
-	errGr := errgroup.Group{}
 	currentPlayerCount := s.players.Len()
 
+	// Launch instances SEQUENTIALLY to ensure correct file order
 	for i := 0; i < missingInstancesNumber; i++ {
 		// Calculate which instance number this will be (0-based for array access)
 		instanceIndex := currentPlayerCount + i
@@ -211,24 +285,23 @@ func (s *Syncer) launchInstances(
 			},
 		}
 
-		// Capture options by value to avoid closure bug
-		launchOpts := options
-		errGr.Go(func() error {
-			s.logger.Info("Launching new instance")
+		s.logger.Info("Launching new instance with file: %s", instanceFileURI)
 
-			newInstance, err := s.instanceLauncher.Launch(ctx, launchOpts)
-			if err != nil {
-				return fmt.Errorf("failed to create new instance: %w", err)
-			}
-			s.players.Add(newPlayer(
-				newInstance,
-				getPlayerSettings(s.settings),
-				s.logger,
-			))
-			return nil
-		})
+		newInstance, err := s.instanceLauncher.Launch(ctx, options)
+		if err != nil {
+			return fmt.Errorf("failed to create new instance: %w", err)
+		}
+
+		newPl := newPlayer(
+			newInstance,
+			getPlayerSettings(s.settings),
+			s.logger,
+		)
+		s.players.Add(newPl)
+
+		s.logger.Info("Instance launched with ID P[%d], file: %s", newPl.GetID(), instanceFileURI)
 	}
-	return errGr.Wait()
+	return nil
 }
 
 func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
@@ -242,10 +315,160 @@ func (s *Syncer) onFileOpened(ctx context.Context, srcPlayerID uint) {
 	go func() {
 		s.launchMissingInstances(ctx, s.settings.GetInstancesNumber().GetValue())
 
+		// If launched without files, try to open the paired file in other instances
+		if len(s.filePaths) == 0 {
+			s.logger.Info("No initial files configured - attempting to find paired file")
+			s.openPairedFileInOtherInstances(ctx, srcPlayerID)
+		}
+
 		// After launching, wait for new instances to be ready, then sync them
 		time.Sleep(300 * time.Millisecond)
 		s.syncNewInstancesWithSource(ctx, srcPlayerID)
 	}()
+}
+
+// openPairedFileInOtherInstances finds the paired file and opens it in other instances
+func (s *Syncer) openPairedFileInOtherInstances(ctx context.Context, srcPlayerID uint) {
+	// Find the source player
+	var srcPlayer *player
+	s.players.Iterate(func(pl *player) bool {
+		if pl.GetID() == srcPlayerID {
+			srcPlayer = pl
+			return false
+		}
+		return true
+	})
+
+	if srcPlayer == nil {
+		return
+	}
+
+	// Get source player's file
+	srcStatus, err := srcPlayer.client.client.GetStatusEx(ctx, repetition.Single())
+	if err != nil || srcStatus.FileURI == "" {
+		s.logger.Err("Cannot find paired file - source has no file loaded")
+		return
+	}
+
+	// Parse the file URI (remove file:// prefix if present)
+	srcFile := strings.TrimPrefix(srcStatus.FileURI, "file://")
+
+	s.logger.Info("Source file: %s", srcFile)
+
+	// Find the paired file
+	pairedFile := s.findPairedFile(srcFile)
+	if pairedFile == "" {
+		s.logger.Info("No paired file found for: %s", srcFile)
+		return
+	}
+
+	s.logger.Info("Found paired file: %s", pairedFile)
+
+	// Open the paired file in all other instances
+	wg := sync.WaitGroup{}
+	s.players.Iterate(func(pl *player) bool {
+		if pl.GetID() != srcPlayerID {
+			wg.Add(1)
+			go func(player *player) {
+				defer wg.Done()
+
+				s.logger.Info("P[%d]: Opening paired file: %s", player.GetID(), pairedFile)
+
+				// Open file
+				_, err := player.client.client.SendCmdGroup(
+					ctx,
+					extended.CmdGroup{
+						OpenFile: typeutil.NewOptional(pairedFile),
+					},
+					repetition.WithInterval(timings.CommandsRepeatInterval),
+				)
+
+				if err != nil {
+					s.logger.Err("P[%d]: Failed to open paired file: %s", player.GetID(), err.Error())
+					return
+				}
+
+				// Wait for playback to actually start before pausing
+				s.logger.Info("P[%d]: Waiting for playback to start...", player.GetID())
+				maxAttempts := 50 // 5 seconds max
+				for attempt := 0; attempt < maxAttempts; attempt++ {
+					status, err := player.client.client.GetStatusEx(ctx, repetition.Single())
+					if err == nil && status.State == basic.PlaybackStatePlaying && status.LengthSec > 0 {
+						s.logger.Info("P[%d]: Playback started, now pausing", player.GetID())
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				// Pause this instance
+				_, _ = player.client.client.SendCmdGroup(
+					ctx,
+					extended.CmdGroup{
+						State: typeutil.NewOptional(basic.PlaybackStatePaused),
+					},
+					repetition.WithInterval(100 * time.Millisecond),
+				)
+
+				s.logger.Info("P[%d]: Paired file opened and paused", player.GetID())
+			}(pl)
+		}
+		return true
+	})
+	wg.Wait()
+
+	// Also pause the source player to keep both instances paused
+	s.logger.Info("P[%d]: Pausing source player", srcPlayerID)
+	if srcPlayer != nil {
+		_, _ = srcPlayer.client.client.SendCmdGroup(
+			ctx,
+			extended.CmdGroup{
+				State: typeutil.NewOptional(basic.PlaybackStatePaused),
+			},
+			repetition.WithInterval(100 * time.Millisecond),
+		)
+		s.logger.Info("P[%d]: Source player paused", srcPlayerID)
+	}
+}
+
+// findPairedFile attempts to find the paired file based on naming convention
+func (s *Syncer) findPairedFile(fileURI string) string {
+	// Parse the file path
+	dir := filepath.Dir(fileURI)
+	filename := filepath.Base(fileURI)
+	ext := filepath.Ext(filename)
+	nameWithoutExt := strings.TrimSuffix(filename, ext)
+
+	var pairedFile string
+
+	// Check if it's a conductor file
+	if strings.HasSuffix(nameWithoutExt, "-conductor") {
+		basename := strings.TrimSuffix(nameWithoutExt, "-conductor")
+		pairedFile = filepath.Join(dir, basename+"-audience"+ext)
+	} else if strings.HasSuffix(nameWithoutExt, "-audience") {
+		basename := strings.TrimSuffix(nameWithoutExt, "-audience")
+		pairedFile = filepath.Join(dir, basename+"-conductor"+ext)
+	} else {
+		// No convention match - try to find conductor or audience variant
+		conductorFile := filepath.Join(dir, nameWithoutExt+"-conductor"+ext)
+		audienceFile := filepath.Join(dir, nameWithoutExt+"-audience"+ext)
+
+		// Check which one exists
+		if _, err := os.Stat(conductorFile); err == nil {
+			pairedFile = conductorFile
+		} else if _, err := os.Stat(audienceFile); err == nil {
+			pairedFile = audienceFile
+		}
+	}
+
+	// Verify the paired file exists
+	if pairedFile != "" {
+		if _, err := os.Stat(pairedFile); err != nil {
+			s.logger.Info("Paired file does not exist: %s", pairedFile)
+			return ""
+		}
+	}
+
+	return pairedFile
 }
 
 // syncNewInstancesWithSource syncs newly launched instances with the source player's current state
@@ -292,13 +515,44 @@ func (s *Syncer) syncNewInstancesWithSource(ctx context.Context, srcPlayerID uin
 		})
 	}
 
-	// Send commands to all other players
+	// Send commands to all other players that have actually loaded a file
 	wg := sync.WaitGroup{}
 	s.players.Iterate(func(pl *player) bool {
 		if pl.GetID() != srcPlayerID {
 			wg.Add(1)
 			go func(player *player) {
 				defer wg.Done()
+
+				// Wait for file to load with timeout
+				timeout := time.After(10 * time.Second)
+				ticker := time.NewTicker(200 * time.Millisecond)
+				defer ticker.Stop()
+
+				fileLoaded := false
+				for !fileLoaded {
+					select {
+					case <-ctx.Done():
+						s.logger.Info("P[%d]: Context cancelled while waiting for file", player.GetID())
+						return
+					case <-timeout:
+						s.logger.Err("P[%d]: Timeout waiting for file to load", player.GetID())
+						return
+					case <-ticker.C:
+						status, err := player.client.client.GetStatusEx(ctx, repetition.Single())
+						if err != nil {
+							s.logger.Err("P[%d]: Failed to get status: %s", player.GetID(), err.Error())
+							continue
+						}
+
+						// Check if file is loaded (FileURI not empty and length > 0)
+						if status.FileURI != "" && status.LengthSec > 0 {
+							fileLoaded = true
+							s.logger.Info("P[%d]: File loaded, ready to sync", player.GetID())
+						}
+					}
+				}
+
+				s.logger.Info("P[%d]: Sending initial play command", player.GetID())
 				_, _ = player.SendCmdGroup(ctx, commands, repetition.WithInterval(timings.CommandsRepeatInterval))
 			}(pl)
 		}
@@ -399,33 +653,22 @@ func (s *Syncer) syncPlayersPosition(
 		Seek: typeutil.NewOptional(positionGetter),
 	}
 
-	for {
-		wg := sync.WaitGroup{}
-		var hasNotRecoverableErr, hasRecoverableErr atomic.Bool
-		hasNotRecoverableErr.Store(false)
-		hasRecoverableErr.Store(false)
+	// Single attempt, no retry loop to avoid choppy audio
+	wg := sync.WaitGroup{}
 
-		s.players.Iterate(func(pl *player) bool {
-			if pl == skipPlayer {
-				return true
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if _, err := pl.SendCmdGroup(ctx, commands, repetition.Single()); err != nil {
-					s.logger.Err("Failed to sync position: %s", err.Error())
-					if pl.IsRecoverableErr(err) {
-						hasRecoverableErr.Store(true)
-					} else {
-						hasNotRecoverableErr.Store(true)
-					}
-				}
-			}()
+	s.players.Iterate(func(pl *player) bool {
+		if pl == skipPlayer {
 			return true
-		})
-		wg.Wait()
-		if ctx.Err() != nil || !hasRecoverableErr.Load() || hasNotRecoverableErr.Load() {
-			return
 		}
-	}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := pl.SendCmdGroup(ctx, commands, repetition.Single()); err != nil {
+				// Log but don't retry - reduces audio choppiness
+				s.logger.Info("Position sync attempt failed (will retry on next update): %s", err.Error())
+			}
+		}()
+		return true
+	})
+	wg.Wait()
 }
